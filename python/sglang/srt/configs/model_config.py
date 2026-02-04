@@ -302,6 +302,8 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
         ):
             self.hf_config.architectures[0] = "MiMoV2MTP"
+        if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
+            self.hf_config.architectures[0] = "Step3p5MTP"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -606,6 +608,11 @@ class ModelConfig:
         if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
             total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
             return max(1, total_num_kv_heads // tensor_parallel_size)
+        elif hasattr(self.hf_text_config, "attention_other_setting"):  # For step3p5
+            total_num_kv_heads = self.hf_text_config.attention_other_setting.get(
+                "num_attention_groups"
+            )
+            return max(1, total_num_kv_heads // tensor_parallel_size)
         else:
             return self.get_num_kv_heads(tensor_parallel_size)
 
@@ -723,9 +730,12 @@ class ModelConfig:
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
         # Check for HuggingFace quantization config
-        from sglang.srt.utils import has_hf_quant_config
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            from sglang.srt.utils import has_hf_quant_config
 
-        return has_hf_quant_config(self.model_path)
+            return has_hf_quant_config(self.model_path)
+        return True
 
     def _get_modelopt_quant_type(self) -> str:
         """Extract ModelOpt quantization type from unified quantization flag."""
@@ -798,6 +808,7 @@ class ModelConfig:
             "mxfp4",
             "auto-round",
             "quark_int4fp8_moe",
+            "auto-round-int8",
         ]
         optimized_quantization_methods = [
             "fp8",
@@ -826,6 +837,7 @@ class ModelConfig:
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
+            "auto-round-int8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
@@ -1268,6 +1280,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "Step3p5ForCausalLM",
+        "Step3p5MTP",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1301,6 +1315,21 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
+    elif "Step3p5ForCausalLM" in model_architectures:
+        layer_types = hf_text_config.layer_types
+        swa_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "sliding_attention" and i < num_hidden_layers
+        ]
+        full_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "full_attention" and i < num_hidden_layers
+        ]
+    elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
     else:
