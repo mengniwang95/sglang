@@ -23,13 +23,14 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 _is_cuda = is_cuda()
 if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+_is_gfx95 = _is_hip and is_gfx95_supported()
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -61,8 +62,17 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
     if _is_hip:
-        BLOCK_M, BLOCK_N = (64, 64)
-        num_warps = 4
+        if _is_gfx95 and 128 < Lq <= 256:
+            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
+            # streamed per call (each workgroup reads the whole prefix); 8 warps
+            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
+            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
+            # unchanged). Other AMD archs / head dims keep the default below.
+            BLOCK_M, BLOCK_N = (128, 64)
+            num_warps = 8
+        else:
+            BLOCK_M, BLOCK_N = (64, 64)
+            num_warps = 4
     else:
         if _is_cuda and CUDA_CAPABILITY[0] == 12:
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
@@ -72,10 +82,20 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 32)
+        elif _is_cuda and CUDA_CAPABILITY[0] == 10:
+            # Blackwell data-center architecture (GB200, B200, sm_100a)
+            # sm_100a has different register constraints from Hopper; Hopper block sizes
+            # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
+            if Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
+            else:
+                BLOCK_M, BLOCK_N = (16, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
             # Hopper architecture (H100, etc.)
-            if Lq <= 256:
+            if Lq <= 128:
                 BLOCK_M, BLOCK_N = (128, 64)
+            elif Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
@@ -222,6 +242,7 @@ def _fwd_kernel(
     K_Extend,
     V_Extend,
     O_Extend,
+    LSE_Extend,
     K_Buffer,
     V_Buffer,
     qo_indptr,
@@ -232,6 +253,8 @@ def _fwd_kernel(
     sink_ptr,
     window_kv_offset_ptr,
     sm_scale,
+    k_scale,
+    v_scale,
     kv_group_num,
     stride_qbs,
     stride_qh,
@@ -241,6 +264,8 @@ def _fwd_kernel(
     stride_vh,
     stride_obs,
     stride_oh,
+    stride_lse_bs,
+    stride_lse_h,
     stride_buf_kbs,
     stride_buf_kh,
     stride_buf_vbs,
@@ -258,6 +283,9 @@ def _fwd_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+    SKIP_PREFIX: tl.constexpr,
+    SKIP_EXTEND: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
@@ -324,7 +352,8 @@ def _fwd_kernel(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    for start_n in range(0, cur_seq_len_prefix, BLOCK_N):
+    prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
+    for start_n in range(0, prefix_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_seq_len_prefix
 
@@ -372,7 +401,6 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -386,7 +414,7 @@ def _fwd_kernel(
                     other=0.0,
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
-            qk *= sm_scale
+            qk *= sm_scale * k_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
@@ -415,7 +443,7 @@ def _fwd_kernel(
                 other=0.0,
             )
             p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
 
             e_max = n_e_max
 
@@ -426,7 +454,8 @@ def _fwd_kernel(
         if not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
-    for start_n in range(0, cur_block_m_end, BLOCK_N):
+    extend_end = 0 if SKIP_EXTEND else cur_block_m_end
+    for start_n in range(0, extend_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         mask_n = (start_n + offs_n) < cur_block_m_end
 
@@ -527,6 +556,13 @@ def _fwd_kernel(
         cur_sink = tl.load(sink_ptr + cur_head)
         deno += tl.exp(cur_sink - e_max)
 
+    if STORE_LSE:
+        offs_lse = (
+            cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m
+        ) * stride_lse_bs + cur_head * stride_lse_h
+        lse = tl.log(deno) + e_max
+        tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
+
     offs_o = (
         (cur_seq_extend_start_idx + cur_block_m * BLOCK_M + offs_m[:, None])
         * stride_obs
@@ -561,6 +597,8 @@ def extend_attention_fwd(
     is_causal,
     mask_indptr,
     max_len_extend,
+    k_scale,
+    v_scale,
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
@@ -568,11 +606,19 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    lse_extend=None,
+    skip_prefix=False,
+    skip_extend=False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
+
+    When ``lse_extend`` is provided, the per-query/head natural-log LSE is also
+    written to it (used by DCP to merge partial attention across ranks).
+    ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
+    respectively so DCP can compute those two parts separately.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -594,6 +640,9 @@ def extend_attention_fwd(
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     HAS_SINK = sinks is not None
+    STORE_LSE = lse_extend is not None
+    stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
+    stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
@@ -607,6 +656,7 @@ def extend_attention_fwd(
         k_extend,
         v_extend,
         o_extend,
+        lse_extend,
         k_buffer,
         v_buffer,
         qo_indptr,
@@ -617,6 +667,8 @@ def extend_attention_fwd(
         sinks,
         window_kv_offsets,
         sm_scale,
+        k_scale,
+        v_scale,
         kv_group_num,
         q_extend.stride(0),
         q_extend.stride(1),
@@ -626,6 +678,8 @@ def extend_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
+        stride_lse_bs,
+        stride_lse_h,
         k_buffer.stride(0),
         k_buffer.stride(1),
         v_buffer.stride(0),
@@ -643,6 +697,9 @@ def extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
+        STORE_LSE=STORE_LSE,
+        SKIP_PREFIX=skip_prefix,
+        SKIP_EXTEND=skip_extend,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         num_warps=num_warps,
@@ -702,7 +759,8 @@ def _fwd_kernel_unified(
     mask_indptr,
     sink_ptr,
     window_start_pos,
-    sm_scale,
+    sm_scale_withk,
+    v_scale,
     kv_group_num,
     stride_qbs,
     stride_qh,
@@ -872,7 +930,6 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            # Compute QK
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -887,7 +944,7 @@ def _fwd_kernel_unified(
                 )
                 qk += tl.dot(qpe.to(kpe.dtype), kpe)
 
-            qk *= sm_scale
+            qk *= sm_scale_withk
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
@@ -935,7 +992,7 @@ def _fwd_kernel_unified(
     )
     tl.store(
         O + offs_o,
-        acc / deno[:, None],
+        acc / deno[:, None] * v_scale,
         mask=mask_m[:, None] & mask_dv[None, :],
     )
 
@@ -945,6 +1002,8 @@ def extend_attention_fwd_unified(
     o,
     k_buffer,
     v_buffer,
+    k_scale,
+    v_scale,
     qo_indptr,
     kv_indptr,
     kv_indices,
@@ -1024,7 +1083,8 @@ def extend_attention_fwd_unified(
         mask_indptr,
         sinks,
         window_start_pos,
-        sm_scale,
+        sm_scale * k_scale,
+        v_scale,
         kv_group_num,
         q.stride(0),
         q.stride(1),

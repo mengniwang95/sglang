@@ -16,6 +16,15 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+template <typename scalar_t>
+inline void convert_from_float_and_store(scalar_t* out, const Vectorized<float>& a) {
+  float out_buffer[at::vec::Vectorized<float>::size()];
+  a.store(out_buffer);
+  for (int i = 0; i < 16; i++) {
+    out[i] = (scalar_t)out_buffer[i];
+  }
+}
+
 // allow f16, bf16
 template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
 inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
@@ -43,6 +52,11 @@ template <>
 inline Vectorized<at::BFloat16>
 convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorized<float>& b) {
   return (__m512i)(_mm512_cvtne2ps_pbh(__m512(b), __m512(a)));
+}
+
+template <>
+inline void convert_from_float_and_store<at::BFloat16>(at::BFloat16* out, const Vectorized<float>& a) {
+  _mm256_storeu_si256((__m256i*)out, (__m256i)(_mm512_cvtneps_pbh(__m512(a))));
 }
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
@@ -145,6 +159,49 @@ inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
 // bias for conversion of fp8 to bf16 1/256 in float32
 #define kFP8_BIAS 0x3b800000
 
+// remove warning: ignoring attributes on template argument ‘__m512bh’ [-Wignored-attributes]
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wignored-attributes"
+
+#define MXFP4_VALUES \
+  -6.0f, -4.0f, -3.0f, -2.0f, -1.5f, -1.0f, -0.5f, -0.0f, 6.0f, 4.0f, 3.0f, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f
+
+// convert 64 mxfp4 to 2x bf16 vectors, expect input 32-way packing
+inline std::tuple<__m512bh, __m512bh> cvt_mxfp4_e2m1_bf16_intrinsic_lut(__m256i a, __m512i s0, __m512i s1) {
+  // LUT
+  const __m512 values = _mm512_set_ps(MXFP4_VALUES);
+  const __m512i lut = (__m512i)(_mm512_cvtne2ps_pbh(values, values));
+
+  const __m512i abs_mask = _mm512_set1_epi16(0x7FFF);
+  const __m512i zero = _mm512_setzero_si512();
+
+  // expand values to 16-bit integers
+  __m512i x0 = _mm512_cvtepu8_epi16(a);
+  __m512i x1 = _mm512_srli_epi32(x0, 4);
+
+  // LUT to convert mxfp4 values to bf16
+  x0 = _mm512_permutexvar_epi16(x0, lut);
+  x1 = _mm512_permutexvar_epi16(x1, lut);
+
+  // check for zeros
+  __mmask32 mask0 = _mm512_cmp_epi16_mask(_mm512_and_si512(x0, abs_mask), zero, _MM_CMPINT_EQ);
+  __mmask32 mask1 = _mm512_cmp_epi16_mask(_mm512_and_si512(x1, abs_mask), zero, _MM_CMPINT_EQ);
+
+  // emulate bf16 mul with scale factor
+  x0 = _mm512_add_epi16(x0, s0);
+  x1 = _mm512_add_epi16(x1, s1);
+
+  // blend with zero
+  x0 = _mm512_mask_blend_epi16(mask0, x0, zero);
+  x1 = _mm512_mask_blend_epi16(mask1, x1, zero);
+
+  return std::make_tuple(__m512bh(x0), __m512bh(x1));
+}
+
+#define CVT_MXFP4_TO_BF16(a, s0, s1) cvt_mxfp4_e2m1_bf16_intrinsic_lut(a, s0, s1)
+
+#pragma GCC diagnostic pop
+
 #endif
 
 // vector to scalar reduction
@@ -230,6 +287,77 @@ inline void quantize_row_int8<at::BFloat16>(
 // transpose utils
 // taken from my PR in ggml: https://github.com/ggml-org/llama.cpp/pull/8998
 #if defined(CPU_CAPABILITY_AVX512)
+inline void transpose_16x16_16bit(__m256i* v) {
+  __m256i v1[16];
+  v1[0] = _mm256_unpacklo_epi16(v[0], v[1]);
+  v1[1] = _mm256_unpackhi_epi16(v[0], v[1]);
+  v1[2] = _mm256_unpacklo_epi16(v[2], v[3]);
+  v1[3] = _mm256_unpackhi_epi16(v[2], v[3]);
+  v1[4] = _mm256_unpacklo_epi16(v[4], v[5]);
+  v1[5] = _mm256_unpackhi_epi16(v[4], v[5]);
+  v1[6] = _mm256_unpacklo_epi16(v[6], v[7]);
+  v1[7] = _mm256_unpackhi_epi16(v[6], v[7]);
+  v1[8] = _mm256_unpacklo_epi16(v[8], v[9]);
+  v1[9] = _mm256_unpackhi_epi16(v[8], v[9]);
+  v1[10] = _mm256_unpacklo_epi16(v[10], v[11]);
+  v1[11] = _mm256_unpackhi_epi16(v[10], v[11]);
+  v1[12] = _mm256_unpacklo_epi16(v[12], v[13]);
+  v1[13] = _mm256_unpackhi_epi16(v[12], v[13]);
+  v1[14] = _mm256_unpacklo_epi16(v[14], v[15]);
+  v1[15] = _mm256_unpackhi_epi16(v[14], v[15]);
+
+  v[0] = _mm256_unpacklo_epi32(v1[0], v1[2]);
+  v[1] = _mm256_unpackhi_epi32(v1[0], v1[2]);
+  v[2] = _mm256_unpacklo_epi32(v1[1], v1[3]);
+  v[3] = _mm256_unpackhi_epi32(v1[1], v1[3]);
+  v[4] = _mm256_unpacklo_epi32(v1[4], v1[6]);
+  v[5] = _mm256_unpackhi_epi32(v1[4], v1[6]);
+  v[6] = _mm256_unpacklo_epi32(v1[5], v1[7]);
+  v[7] = _mm256_unpackhi_epi32(v1[5], v1[7]);
+  v[8] = _mm256_unpacklo_epi32(v1[8], v1[10]);
+  v[9] = _mm256_unpackhi_epi32(v1[8], v1[10]);
+  v[10] = _mm256_unpacklo_epi32(v1[9], v1[11]);
+  v[11] = _mm256_unpackhi_epi32(v1[9], v1[11]);
+  v[12] = _mm256_unpacklo_epi32(v1[12], v1[14]);
+  v[13] = _mm256_unpackhi_epi32(v1[12], v1[14]);
+  v[14] = _mm256_unpacklo_epi32(v1[13], v1[15]);
+  v[15] = _mm256_unpackhi_epi32(v1[13], v1[15]);
+
+  v1[0] = _mm256_unpacklo_epi64(v[0], v[4]);
+  v1[1] = _mm256_unpackhi_epi64(v[0], v[4]);
+  v1[2] = _mm256_unpacklo_epi64(v[1], v[5]);
+  v1[3] = _mm256_unpackhi_epi64(v[1], v[5]);
+  v1[4] = _mm256_unpacklo_epi64(v[2], v[6]);
+  v1[5] = _mm256_unpackhi_epi64(v[2], v[6]);
+  v1[6] = _mm256_unpacklo_epi64(v[3], v[7]);
+  v1[7] = _mm256_unpackhi_epi64(v[3], v[7]);
+  v1[8] = _mm256_unpacklo_epi64(v[8], v[12]);
+  v1[9] = _mm256_unpackhi_epi64(v[8], v[12]);
+  v1[10] = _mm256_unpacklo_epi64(v[9], v[13]);
+  v1[11] = _mm256_unpackhi_epi64(v[9], v[13]);
+  v1[12] = _mm256_unpacklo_epi64(v[10], v[14]);
+  v1[13] = _mm256_unpackhi_epi64(v[10], v[14]);
+  v1[14] = _mm256_unpacklo_epi64(v[11], v[15]);
+  v1[15] = _mm256_unpackhi_epi64(v[11], v[15]);
+
+  v[0] = _mm256_permute2x128_si256(v1[0], v1[8], 0x20);
+  v[1] = _mm256_permute2x128_si256(v1[1], v1[9], 0x20);
+  v[2] = _mm256_permute2x128_si256(v1[2], v1[10], 0x20);
+  v[3] = _mm256_permute2x128_si256(v1[3], v1[11], 0x20);
+  v[4] = _mm256_permute2x128_si256(v1[4], v1[12], 0x20);
+  v[5] = _mm256_permute2x128_si256(v1[5], v1[13], 0x20);
+  v[6] = _mm256_permute2x128_si256(v1[6], v1[14], 0x20);
+  v[7] = _mm256_permute2x128_si256(v1[7], v1[15], 0x20);
+  v[8] = _mm256_permute2x128_si256(v1[0], v1[8], 0x31);
+  v[9] = _mm256_permute2x128_si256(v1[1], v1[9], 0x31);
+  v[10] = _mm256_permute2x128_si256(v1[2], v1[10], 0x31);
+  v[11] = _mm256_permute2x128_si256(v1[3], v1[11], 0x31);
+  v[12] = _mm256_permute2x128_si256(v1[4], v1[12], 0x31);
+  v[13] = _mm256_permute2x128_si256(v1[5], v1[13], 0x31);
+  v[14] = _mm256_permute2x128_si256(v1[6], v1[14], 0x31);
+  v[15] = _mm256_permute2x128_si256(v1[7], v1[15], 0x31);
+}
+
 inline void transpose_16x16_32bit(__m512i* v) {
   __m512i v1[16];
   v1[0] = _mm512_unpacklo_epi32(v[0], v[1]);

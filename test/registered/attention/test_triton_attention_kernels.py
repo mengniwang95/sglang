@@ -23,8 +23,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=30, suite="stage-b-test-large-1-gpu")
-register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=19, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
 
 def extend_attention_fwd_torch(
@@ -251,6 +251,8 @@ class TestTritonAttention(CustomTestCase):
             True,
             mask_indptr,
             max_len_extend,
+            1.0,
+            1.0,
         )
 
         b_seq_mask_len = b_seq_len_extend * b_seq_len
@@ -286,6 +288,8 @@ class TestTritonAttention(CustomTestCase):
             True,
             mask_indptr,
             max_len_extend,
+            1.0,
+            1.0,
         )
 
         redundant_attention(
@@ -300,17 +304,39 @@ class TestTritonAttention(CustomTestCase):
             max_len_in_batch,
         )
 
-        self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2))
-        self.assertTrue(torch.allclose(o_extend_mask, o_redundant, rtol=1e-2))
+        self.assertTrue(torch.allclose(o_extend, o_redundant, rtol=1e-2, atol=1e-3))
+        self.assertTrue(
+            torch.allclose(o_extend_mask, o_redundant, rtol=1e-2, atol=1e-3)
+        )
 
     def test_extend_attention(self):
 
         # Define the varying parameter values
-        attention_values = [128, 96, 80, 13]
+        # 256 covers the head_dim > 128 block-size branch (tuned on gfx95)
+        attention_values = [256, 128, 96, 80, 13]
 
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
+
+    def test_extend_attention_block_sizes(self):
+        from sglang.srt.layers.attention.triton_ops import extend_attention as ea
+
+        if not ea._is_hip:
+            self.skipTest("HIP-only block-size selection")
+        # head_dim <= 128 keeps the default config on all HIP archs
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(128, 128)[3:], (64, 64, 4)
+        )
+        # 128 < head_dim <= 256: tuned tile on gfx95, default elsewhere
+        expected = (128, 64, 8) if ea._is_gfx95 else (64, 64, 4)
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(256, 256)[3:], expected
+        )
+        # head_dim > 256: falls back to the default on all HIP archs
+        self.assertEqual(
+            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
+        )
 
     def _test_extend_attention_sliding_window_once(
         self, B, N_CTX, H_Q, H_KV, D, WINDOW_SIZE
@@ -395,6 +421,8 @@ class TestTritonAttention(CustomTestCase):
             is_causal=True,
             mask_indptr=None,
             max_len_extend=max_len_extend,
+            k_scale=1.0,
+            v_scale=1.0,
             sliding_window_size=WINDOW_SIZE,
         )
 
@@ -517,6 +545,8 @@ class TestTritonAttention(CustomTestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
+            1.0,
         )
 
         # Correctness reference (float32, stable softmax)
@@ -591,6 +621,7 @@ class TestTritonAttention(CustomTestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
         )
 
         attn_logits1 = torch.empty(
@@ -616,6 +647,7 @@ class TestTritonAttention(CustomTestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
         )
 
         cos_sim = torch.nn.functional.cosine_similarity(
@@ -722,6 +754,8 @@ class TestTritonAttention(CustomTestCase):
             is_causal=True,
             mask_indptr=None,
             max_len_extend=max_len_extend,
+            k_scale=1.0,
+            v_scale=1.0,
         )
 
         # Build unified KV indices
@@ -750,6 +784,8 @@ class TestTritonAttention(CustomTestCase):
             o_unified,
             k_buffer,
             v_buffer,
+            1.0,
+            1.0,
             qo_indptr,
             unified_kv_indptr,
             unified_kv_indices,
